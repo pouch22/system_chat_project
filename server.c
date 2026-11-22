@@ -49,6 +49,7 @@ static void broadcast_user_list(void) {
             snprintf(pkt.content + cur_len, MAX_MSG_LEN - cur_len, "%s\n", clients[i].nickname);
         }
     }
+    printf("\n접속자 명단\n==========\n%s\n", pkt.content);
     broadcast_packet(&pkt, -1);
 }
 
