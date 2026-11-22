@@ -18,8 +18,8 @@
 /* =========================================================================
  * 1. 시스템 통신 기본 설정 
  * ========================================================================= */
-#define SOCKET_PATH     "/tmp/test.sock"                /* 통신에 사용할 도메인 소켓 경로 ex /tmp/sysprog_chat.sock */ 
-#define HISTORY_FILE    "testchat.log"                  /* 대화 기록을 저장할 파일 이름 ex chat_history.log */
+#define SOCKET_PATH     "/tmp/sysprog_chat.sock"                /* 통신에 사용할 도메인 소켓 경로 ex /tmp/sysprog_chat.sock */ 
+#define HISTORY_FILE    "chat_history.log"                  /* 대화 기록을 저장할 파일 이름 ex chat_history.log */
 #define MAX_CLIENTS     16                              /* 최대 동시 접속 인원 */
 #define MAX_NAME_LEN    32                              /* 닉네임 최대 길이 (바이트) */
 #define MAX_MSG_LEN     512                             /* 한 번에 보낼 수 있는 메시지 최대 길이 */
