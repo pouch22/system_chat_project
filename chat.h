@@ -18,11 +18,12 @@
 /* =========================================================================
  * 1. 시스템 통신 기본 설정 
  * ========================================================================= */
-#define SOCKET_PATH     "/tmp/test.sock"            /* 통신에 사용할 도메인 소켓 경로 ex /tmp/sysprog_chat.sock */ 
-#define HISTORY_FILE    "testchat.log"              /* 대화 기록을 저장할 파일 이름 ex chat_history.log */
-#define MAX_CLIENTS     16                          /* 최대 동시 접속 인원 */
-#define MAX_NAME_LEN    32                          /* 닉네임 최대 길이 (바이트) */
-#define MAX_MSG_LEN     512                         /* 한 번에 보낼 수 있는 메시지 최대 길이 */
+#define SOCKET_PATH     "/tmp/test.sock"                /* 통신에 사용할 도메인 소켓 경로 ex /tmp/sysprog_chat.sock */ 
+#define HISTORY_FILE    "testchat.log"                  /* 대화 기록을 저장할 파일 이름 ex chat_history.log */
+#define MAX_CLIENTS     16                              /* 최대 동시 접속 인원 */
+#define MAX_NAME_LEN    32                              /* 닉네임 최대 길이 (바이트) */
+#define MAX_MSG_LEN     512                             /* 한 번에 보낼 수 있는 메시지 최대 길이 */
+#define RECENT_HISTORY  20                              /* 261122 JM 추가, 신규 입장 시 불러올 최근 대화 개수 */
 
 /* =========================================================================
  * 2. 메시지 종류 
@@ -32,7 +33,7 @@ typedef enum {
     MSG_TYPE_CHAT,             /* 모두에게 보내는 일반 단톡방 채팅 */
     MSG_TYPE_WHISPER,          /* 특정 사람에게만 보내는 귓속말 */
     MSG_TYPE_LEAVE,            /* 정상적으로 방을 나감 (퇴장) */
-    MSG_TYPE_NOTICE            /* 서버가 전체에게 띄우는 시스템 공지 */
+    MSG_TYPE_NOTICE,            /* 서버가 전체에게 띄우는 시스템 공지 */
     MSG_TYPE_USERLIST          /* 261122 JM추가. 접속자 리스트 동기화를 위한 패킷 */
 } MessageType;
 
@@ -107,5 +108,8 @@ static inline ssize_t recv_all(int sock_fd, void *buf, size_t len) {
     }
     return (ssize_t)total_received; /* 수신 성공한 바이트 수 반환 */
 }
+/* 파일 기록 모듈 (old_chat.c) 연동 함수 */
+int log_message(const Packet *pkt);
+int load_recent_history(Packet *out_packets, int max_count);
 
 #endif /* CHAT_H */
