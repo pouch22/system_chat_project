@@ -35,6 +35,24 @@ static void broadcast_packet(const Packet *pkt, int exclude_fd) {
     }
 }
 
+/* 261122 JM 추가, chat.h에도 패킷 추가 완료(MSG_TYPE_USERLIST) */
+/* 현재 접속 중인 모든 사용자 닉네임을 모아서 전원에게 전송 */
+static void broadcast_user_list(void) {
+    Packet pkt;
+    memset(&pkt, 0, PACKET_SIZE);
+    pkt.type = MSG_TYPE_USERLIST;
+    strncpy(pkt.sender, "시스템", MAX_NAME_LEN - 1);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].active) {
+            size_t cur_len = strlen(pkt.content);
+            snprintf(pkt.content + cur_len, MAX_MSG_LEN - cur_len, "%s\n", clients[i].nickname);
+        }
+    }
+    broadcast_packet(&pkt, -1);
+}
+
+
 /* 귓속말 전송 */
 static void send_whisper(const Packet *pkt, int sender_fd) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -79,6 +97,7 @@ static void remove_client(int fd) {
         notice.timestamp = time(NULL);
         broadcast_packet(&notice, -1);
     }
+    broadcast_user_list(); /* 261122 JM 추가: 누군가 나가면 목록 갱신 */
 }
 
 int main(void) {
@@ -129,9 +148,9 @@ int main(void) {
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
 
     printf("==================================================\n");
-    printf(" 🚀 리눅스 터미널 채팅 서버 가동 완료!\n");
-    printf(" 📍 소켓 경로: %s\n", SOCKET_PATH);
-    printf(" 🛑 종료하려면 Ctrl+C 를 누르세요.\n");
+    printf(" 리눅스 터미널 채팅 서버 가동 중\n");
+    printf(" 소켓 경로: %s\n", SOCKET_PATH);
+    printf(" 종료하려면 Ctrl+C\n");
     printf("==================================================\n");
 
     /* 3. 메인 이벤트 루프 */
@@ -207,6 +226,7 @@ int main(void) {
                     snprintf(notice.content, MAX_MSG_LEN, "%s 님이 입장하셨습니다.", pkt.sender);
                     notice.timestamp = time(NULL);
                     broadcast_packet(&notice, -1);
+                    broadcast_user_list(); /* 2612 JM추가 누군가 들어오면 목록 갱신 */
 
                 } else if (pkt.type == MSG_TYPE_CHAT) {
                     printf("[채팅] [%s]: %s\n", pkt.sender, pkt.content);
