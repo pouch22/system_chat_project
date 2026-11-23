@@ -31,12 +31,17 @@ typedef struct {
 /* curses와 공유 상태는 ui_lock으로 보호한다. 소켓 I/O 중에는 잠금을 놓는다. */
 static pthread_mutex_t ui_lock = PTHREAD_MUTEX_INITIALIZER;
 static WINDOW *chat_win, *input_win;
+static WINDOW *notice_win;
+static int conflict_notice_shown;
 static wchar_t history[MAX_HISTORY][HISTORY_CHARS];
 static int history_head, history_count, scroll_offset;
 static wchar_t input[MAX_MSG_LEN];
 static size_t input_len, input_bytes;
 static size_t input_cursor, selection_anchor, input_view_start;
 static EditStack undo_stack, redo_stack;
+static char user_names[MAX_CLIENTS][MAX_NAME_LEN];
+static int user_count, user_list_ready;
+static int join_notice_seen, nickname_checked, nickname_conflict;
 static int running = 1;
 static char status_text[160];
 static char nickname[MAX_NAME_LEN];
@@ -56,6 +61,13 @@ static size_t selection_start(void) {
 
 static size_t selection_end(void) {
     return input_cursor > selection_anchor ? input_cursor : selection_anchor;
+}
+
+static void clear_input_locked(void) {
+    input_len = input_bytes = 0;
+    input_cursor = selection_anchor = input_view_start = 0;
+    undo_stack.count = redo_stack.count = 0;
+    input[0] = L'\0';
 }
 
 /* 터미널의 기본 깜빡임 설정과 무관하게 커서 표시를 0.5초마다 전환한다.
@@ -240,8 +252,55 @@ static int input_columns(size_t first, size_t last) {
     return columns;
 }
 
+/* 중복 안내는 채팅/입력창 대신 가운데 직사각형 공지창만 표시한다. */
+static void render_conflict_notice_locked(void) {
+    if (notice_win) delwin(notice_win);
+    notice_win = NULL;
+    curs_set(0);
+    erase();
+    wnoutrefresh(stdscr);
+    int height = LINES < 11 ? LINES : 11;
+    int width = COLS < 72 ? COLS : 72;
+    if (height < 5 || width < 16) {
+        mvaddnstr(0, 0, "Duplicate name", COLS > 1 ? COLS - 1 : 0);
+        wnoutrefresh(stdscr);
+        doupdate();
+        return;
+    }
+    notice_win = newwin(height, width, (LINES - height) / 2, (COLS - width) / 2);
+    if (!notice_win) {
+        mvaddnstr(0, 0, "Duplicate name", COLS - 1);
+        wnoutrefresh(stdscr);
+        doupdate();
+        return;
+    }
+    box(notice_win, 0, 0);
+    wattron(notice_win, A_BOLD);
+    mvwaddnwstr(notice_win, 1, 2, L"닉네임 중복", 6);
+    wattroff(notice_win, A_BOLD);
+    char message[MAX_MSG_LEN];
+    snprintf(message, sizeof(message), "'%s' 닉네임은 이미 사용 중입니다. 다른 닉네임으로 다시 접속하세요.", nickname);
+    wchar_t text[MAX_MSG_LEN];
+    decode_text(text, MAX_MSG_LEN, message);
+    size_t start = 0;
+    for (int row = 3; row < height - 3 && text[start]; ++row) {
+        size_t end = wrap_end(text, start, width - 4);
+        mvwaddnwstr(notice_win, row, 2, text + start, (int)(end - start));
+        start = end;
+    }
+    const wchar_t *hint = L"Enter 키로 종료";
+    size_t end = wrap_end(hint, 0, width - 4);
+    mvwaddnwstr(notice_win, height - 2, 2, hint, (int)end);
+    wnoutrefresh(notice_win);
+    doupdate();
+}
+
 /* 호출자는 ui_lock 소유. 입력창을 마지막에 갱신하여 입력 커서를 복원한다. */
 static void render_locked(void) {
+    if (nickname_conflict) {
+        render_conflict_notice_locked();
+        return;
+    }
     if (!chat_win || !input_win) {
         update_cursor_blink_locked(0);
         erase();
@@ -264,7 +323,20 @@ static void render_locked(void) {
 
     werase(chat_win);
     box(chat_win, 0, 0);
-    mvwaddnstr(chat_win, 0, 2, " Chat | Up/Down PgUp/PgDn ", width - 2);
+    /* 한글 표시 폭에 맞춰 내 닉네임을 오른쪽 위에 정렬한다.
+     * 좁은 창에서는 이름을 문자 단위로 줄이고 왼쪽 제목과 겹치지 않게 한다. */
+    wchar_t shown_name[MAX_NAME_LEN];
+    decode_text(shown_name, MAX_NAME_LEN, nickname);
+    shown_name[wrap_end(shown_name, 0, width - 6)] = L'\0';
+    wchar_t name_label[MAX_NAME_LEN + 4];
+    swprintf(name_label, MAX_NAME_LEN + 4, L" [%ls] ", shown_name);
+    int name_width = wcswidth(name_label, wcslen(name_label));
+    int name_x = getmaxx(chat_win) - 2 - name_width;
+    if (name_x > 3)
+        mvwaddnstr(chat_win, 0, 2, " Chat | Up/Down PgUp/PgDn ", name_x - 3);
+    wattron(chat_win, A_BOLD);
+    mvwaddwstr(chat_win, 0, name_x, name_label);
+    wattroff(chat_win, A_BOLD);
     int row = 0, drawn = 0;
     for (int i = 0; i < history_count && drawn < visible; ++i) {
         const wchar_t *text = history[(history_head + i) % MAX_HISTORY];
@@ -287,7 +359,7 @@ static void render_locked(void) {
 
     werase(input_win);
     box(input_win, 0, 0);
-    mvwaddnstr(input_win, 0, 2, " Input | /w name text | /quit ", width - 2);
+    mvwaddnstr(input_win, 0, 2, " Input | /users | /w name text | /quit ", width - 2);
     mvwaddstr(input_win, 1, 1, "> ");
     /* 편집 커서가 보이도록 가로 스크롤하고 선택 영역은 반전 표시한다. */
     int available = width - 3;
@@ -366,6 +438,53 @@ static void add_message_locked(const Packet *packet) {
     render_locked();
 }
 
+/* 기존 서버가 입퇴장 때 보내는 목록은 캐시만 갱신한다.
+ * 내 입장 공지 이후의 첫 목록에서만 중복을 검사한다. 이후 검사까지
+ * 반복하면 나중에 같은 이름으로 들어온 사람 때문에 기존 사용자도 종료된다.
+ * 서버 수정 없이 입장 후 감지하는 방식이므로 동시 접속의 완전한 배제는 불가능하다. */
+static void update_user_list_locked(const char *content) {
+    char list[MAX_MSG_LEN];
+    snprintf(list, sizeof(list), "%s", content);
+    user_count = 0;
+    int my_name_count = 0;
+    char *save = NULL;
+    for (char *name = strtok_r(list, "\n", &save);
+         name && user_count < MAX_CLIENTS; name = strtok_r(NULL, "\n", &save)) {
+        size_t length = strlen(name);
+        if (length >= MAX_NAME_LEN) continue;
+        memcpy(user_names[user_count++], name, length + 1);
+        if (strcmp(name, nickname) == 0) ++my_name_count;
+    }
+    user_list_ready = 1;
+    if (!nickname_checked && join_notice_seen && my_name_count > 0) {
+        nickname_checked = 1;
+        if (my_name_count > 1) {
+            nickname_conflict = 1;
+            running = 0;
+            snprintf(status_text, sizeof(status_text), "이미 사용 중인 닉네임입니다. 다른 닉네임으로 접속하세요.");
+        }
+    }
+}
+
+/* 로컬 출력이므로 조회 명령과 결과가 다른 사용자/서버 로그로 전달되지 않는다. */
+static void show_user_list_locked(void) {
+    Packet notice = {0};
+    notice.type = MSG_TYPE_NOTICE;
+    notice.timestamp = time(NULL);
+    if (!user_list_ready) {
+        snprintf(notice.content, sizeof(notice.content), "접속자 목록 동기화 중입니다. 잠시 후 /users를 다시 입력하세요.");
+        add_message_locked(&notice);
+        return;
+    }
+    snprintf(notice.content, sizeof(notice.content), "현재 참가자 %d명 (나에게만 표시)", user_count);
+    add_message_locked(&notice);
+    for (int i = 0; i < user_count; ++i) {
+        snprintf(notice.content, sizeof(notice.content), "%d. %.*s%s", i + 1,
+                 MAX_NAME_LEN - 1, user_names[i], strcmp(user_names[i], nickname) == 0 ? " (나)" : "");
+        add_message_locked(&notice);
+    }
+}
+
 static void *receive_worker(void *arg) {
     (void)arg;
     for (;;) {
@@ -385,8 +504,32 @@ static void *receive_worker(void *arg) {
         }
         packet.sender[MAX_NAME_LEN - 1] = '\0';
         packet.content[MAX_MSG_LEN - 1] = '\0';
-        add_message_locked(&packet);
+        /* 일부 서버는 목록 대신 중복 거절 공지를 보내고 바로 연결을 닫는다.
+         * 이를 일반 채팅으로 출력하면 EOF 안내가 입력창에 남게 되므로,
+         * 목록에서 중복을 발견했을 때와 같은 전용 공지창으로 연결한다. */
+        if (!nickname_checked &&
+            (packet.type == MSG_TYPE_NOTICE || packet.type == MSG_TYPE_JOIN) &&
+            strcmp(packet.sender, "시스템") == 0 &&
+            strstr(packet.content, "이미 사용 중인 닉네임") != NULL) {
+            nickname_conflict = 1;
+            running = 0;
+        } else if (packet.type == MSG_TYPE_USERLIST) {
+            update_user_list_locked(packet.content);
+        } else {
+            char own_join[MAX_MSG_LEN];
+            snprintf(own_join, sizeof(own_join), "%s 님이 입장하셨습니다.", nickname);
+            if (packet.type == MSG_TYPE_NOTICE && strcmp(packet.sender, "시스템") == 0 &&
+                strcmp(packet.content, own_join) == 0)
+                join_notice_seen = 1;
+            add_message_locked(&packet);
+        }
+        int conflict = nickname_conflict;
         pthread_mutex_unlock(&ui_lock);
+        if (conflict) {
+            /* 안내를 읽는 동안에도 서버에서는 중복 접속이 즉시 정리되게 한다. */
+            shutdown(sock_fd, SHUT_RDWR);
+            break;
+        }
     }
     return NULL;
 }
@@ -405,6 +548,19 @@ static int prepare_message_locked(Packet *packet) {
     if (strcmp(text, "/quit") == 0) {
         packet->type = MSG_TYPE_LEAVE;
         return 1;
+    }
+    if (!nickname_checked) {
+        snprintf(status_text, sizeof(status_text), "닉네임 확인 중입니다. 잠시 후 다시 전송하세요.");
+        return 0;
+    }
+    if (strcmp(text, "/users") == 0) {
+        show_user_list_locked();
+        clear_input_locked();
+        return 0;
+    }
+    if (strncmp(text, "/users ", 7) == 0) {
+        snprintf(status_text, sizeof(status_text), "사용법: /users (추가 인수 없이 입력)");
+        return 0;
     }
     if (strcmp(text, "/w") == 0 || strncmp(text, "/w ", 3) == 0) {
         char *target = text + 2;
@@ -574,6 +730,28 @@ int main(int argc, char **argv) {
         Packet outgoing;
         int send_packet = 0;
         pthread_mutex_lock(&ui_lock);
+        if (nickname_conflict) {
+            exit_status = EXIT_FAILURE;
+            if (!conflict_notice_shown) {
+                clear_input_locked();
+                flushinp(); /* 공지 이전에 입력한 문자/키 시퀀스를 버린다. */
+                if (chat_win) delwin(chat_win);
+                if (input_win) delwin(input_win);
+                chat_win = input_win = NULL;
+                keypad(stdscr, FALSE);
+                render_conflict_notice_locked();
+                conflict_notice_shown = 1;
+            }
+            /* 한글 완성/후속 바이트를 기다리지 않고 첫 입력 바이트로 종료한다. */
+            int key = wgetch(stdscr);
+            if (key == KEY_RESIZE) render_conflict_notice_locked();
+            else if (key != ERR) flushinp(); /* 한글/방향키의 남은 바이트도 정리 */
+            pthread_mutex_unlock(&ui_lock);
+            if (key != ERR && key != KEY_RESIZE) break;
+            struct timespec pause = {0, 1000000};
+            nanosleep(&pause, NULL);
+            continue;
+        }
         wint_t key;
         int result = wget_wch(stdscr, &key); /* 입력도 curses 함수이므로 잠금 필수 */
         if (!running) {
@@ -606,11 +784,8 @@ int main(int argc, char **argv) {
                 exit_status = EXIT_FAILURE;
             } else if (outgoing.type != MSG_TYPE_LEAVE) {
                 add_message_locked(&outgoing);
-                input_len = input_bytes = 0;
-                input_cursor = selection_anchor = input_view_start = 0;
                 /* 이미 전송한 메시지는 실행 취소로 복원하지 않는다. */
-                undo_stack.count = redo_stack.count = 0;
-                input[0] = L'\0';
+                clear_input_locked();
             }
             render_locked();
             pthread_mutex_unlock(&ui_lock);
@@ -628,6 +803,11 @@ int main(int argc, char **argv) {
     close(sock_fd);
     if (chat_win) delwin(chat_win);
     if (input_win) delwin(input_win);
+    if (notice_win) delwin(notice_win);
     endwin();
+    if (nickname_conflict) {
+        fprintf(stderr, "이미 사용 중인 닉네임 '%s'입니다. 다른 닉네임으로 다시 접속하세요.\n", nickname);
+        exit_status = EXIT_FAILURE;
+    }
     return exit_status;
 }
