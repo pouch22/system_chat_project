@@ -69,7 +69,7 @@ static inline ssize_t send_all(int sock_fd, const void *buf, size_t len) {
         // 에러처리
         if (sent <= 0) {
             // 만약 EINTR에러면 계속 진행 인터럽트 에러
-            if (sent < 0 && (errno ==    EINTR || errno == EAGAIN)) continue;
+            if (sent < 0 && errno == EINTR) continue;
             return -1; /* 에러 발생 */
         }
         // 옮긴 데이터 누적
@@ -101,7 +101,7 @@ static inline ssize_t recv_all(int sock_fd, void *buf, size_t len) {
     while (total_received < len) {
         ssize_t received = read(sock_fd, ptr + total_received, len - total_received);
         if (received <= 0) {
-            if (received < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (received < 0 && errno == EINTR) continue;
             return received; /* 0: 상대방이 나감, -1: 에러 발생 */
         }
         total_received += received;

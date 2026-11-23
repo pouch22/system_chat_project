@@ -1,5 +1,6 @@
 #include "chat.h"
 #include <sys/epoll.h>
+#include <sys/time.h>
 
 #define MAX_EVENTS 32
 
@@ -12,10 +13,16 @@ typedef struct {
 static ClientInfo clients[MAX_CLIENTS];
 static int server_fd = -1;
 static int epoll_fd = -1;
+static volatile sig_atomic_t stop_requested = 0;
 
-/* Ctrl+C 종료 시 소켓 파일을 깔끔하게 지우는 시그널 핸들러 */
+/* Ctrl+C/SIGTERM 종료 시 플래그만 설정하는 시그널 핸들러 (Async-Signal-Safe) */
 static void handle_sigint(int sig) {
     (void)sig;
+    stop_requested = 1;
+}
+
+/* 종료 시 열려있는 소켓과 소켓 파일을 안전하게 정리 */
+static void cleanup_server(void) {
     printf("\n[서버] 종료 신호 감지. 자원을 정리합니다...\n");
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].active) close(clients[i].fd);
@@ -23,7 +30,6 @@ static void handle_sigint(int sig) {
     if (server_fd != -1) close(server_fd);
     if (epoll_fd != -1) close(epoll_fd);
     unlink(SOCKET_PATH);
-    exit(0);
 }
 
 /* 특정 클라이언트를 제외한 모두에게 패킷 전송 (exclude_fd가 -1이면 전원에게 전송) */
@@ -62,7 +68,7 @@ static void send_whisper(const Packet *pkt, int sender_fd) {
             return;
         }
     }
-    /* 상대를 못 찾은 경우 보낸 사람에게 안내 */
+    /* 상대가 없는 경우 */
     Packet err_pkt;
     memset(&err_pkt, 0, PACKET_SIZE);
     err_pkt.type = MSG_TYPE_NOTICE;
@@ -104,8 +110,12 @@ static void remove_client(int fd) {
 int main(void) {
     /* 클라이언트가 갑자기 종료될 때 서버가 죽지 않도록 SIGPIPE 무시 */
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, handle_sigint);
-    signal(SIGTERM, handle_sigint);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     memset(clients, 0, sizeof(clients));
 
@@ -155,7 +165,7 @@ int main(void) {
     printf("==================================================\n");
 
     /* 3. 메인 이벤트 루프 */
-    while (1) {
+    while (!stop_requested) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         if (nfds < 0) {
             if (errno == EINTR) continue;
@@ -185,6 +195,11 @@ int main(void) {
                     continue;
                 }
 
+                /* 비정상/멈춘 클라이언트의 부분 송수신으로 서버가 영구 블로킹되는 것을 방지 */
+                struct timeval tv = {3, 0};
+                setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
                 clients[slot].fd = client_fd;
                 clients[slot].active = 1;
                 strcpy(clients[slot].nickname, "익명");
@@ -202,6 +217,11 @@ int main(void) {
                     continue;
                 }
 
+                /* 수신 패킷 문자열 강제 널 종료 (버퍼 초과 읽기 방지) */
+                pkt.sender[MAX_NAME_LEN - 1] = '\0';
+                pkt.receiver[MAX_NAME_LEN - 1] = '\0';
+                pkt.content[MAX_MSG_LEN - 1] = '\0';
+
                 if (pkt.type == MSG_TYPE_JOIN) {
                     /* 닉네임 등록 */
                     for (int j = 0; j < MAX_CLIENTS; j++) {
@@ -212,7 +232,7 @@ int main(void) {
                     }
                     printf("[서버] 입장: %s (fd: %d)\n", pkt.sender, curr_fd);
 
-                    /* 1) 새로 들어온 사람에게 최근 대화 기록(최대 20개) 전송 */
+                    /* 1) 새로 들어온 사람에게 최근 대화 기록 전송 */
                     Packet history_pkts[RECENT_HISTORY];
                     int hist_cnt = load_recent_history(history_pkts, RECENT_HISTORY);
                     for (int h = 0; h < hist_cnt; h++) {
@@ -230,12 +250,27 @@ int main(void) {
                     broadcast_user_list(); /* 2612 JM추가 누군가 들어오면 목록 갱신 */
 
                 } else if (pkt.type == MSG_TYPE_CHAT) {
+                    /* 발신자 위조 방지: 서버에 등록된 닉네임으로 보정 */
+                    /* 패킷의 닉네임을 믿지말고 서버가 가지고 있는 닉네임으로 변경, 사칭 방어*/
+                    for (int j = 0; j < MAX_CLIENTS; j++) {
+                        if (clients[j].active && clients[j].fd == curr_fd) {
+                            snprintf(pkt.sender, MAX_NAME_LEN, "%s", clients[j].nickname);
+                            break;
+                        }
+                    }
                     printf("[채팅] [%s]: %s\n", pkt.sender, pkt.content);
                     /* 파일에 기록 후 다른 사람들에게 브로드캐스트 */
                     log_message(&pkt);
                     broadcast_packet(&pkt, curr_fd);
 
                 } else if (pkt.type == MSG_TYPE_WHISPER) {
+                    /* 발신자 위조 방지: 서버에 등록된 닉네임으로 보정 */
+                    for (int j = 0; j < MAX_CLIENTS; j++) {
+                        if (clients[j].active && clients[j].fd == curr_fd) {
+                            snprintf(pkt.sender, MAX_NAME_LEN, "%s", clients[j].nickname);
+                            break;
+                        }
+                    }
                     printf("[귓속말] [%s -> %s]: %s\n", pkt.sender, pkt.receiver, pkt.content);
                     send_whisper(&pkt, curr_fd);
 
@@ -246,6 +281,6 @@ int main(void) {
         }
     }
 
-    handle_sigint(0);
+    cleanup_server();
     return 0;
 }
