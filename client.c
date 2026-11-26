@@ -487,6 +487,9 @@ static void show_user_list_locked(void) {
 
 static void *receive_worker(void *arg) {
     (void)arg;
+    char own_join[MAX_MSG_LEN], own_leave[MAX_MSG_LEN];
+    snprintf(own_join, sizeof(own_join), "%s 님이 입장하셨습니다.", nickname);
+    snprintf(own_leave, sizeof(own_leave), "%s 님이 퇴장하셨습니다.", nickname);
     for (;;) {
         Packet packet;
         ssize_t n = recv_all(sock_fd, &packet, PACKET_SIZE);
@@ -504,6 +507,12 @@ static void *receive_worker(void *arg) {
         }
         packet.sender[MAX_NAME_LEN - 1] = '\0';
         packet.content[MAX_MSG_LEN - 1] = '\0';
+        /* 내 연결에서 받은 같은 닉네임의 퇴장 공지는 다른 연결의 퇴장이다. */
+        if (packet.type == MSG_TYPE_NOTICE && strcmp(packet.sender, "시스템") == 0 &&
+            strcmp(packet.content, own_leave) == 0) {
+            pthread_mutex_unlock(&ui_lock);
+            continue;
+        }
         /* 일부 서버는 목록 대신 중복 거절 공지를 보내고 바로 연결을 닫는다.
          * 이를 일반 채팅으로 출력하면 EOF 안내가 입력창에 남게 되므로,
          * 목록에서 중복을 발견했을 때와 같은 전용 공지창으로 연결한다. */
@@ -516,11 +525,15 @@ static void *receive_worker(void *arg) {
         } else if (packet.type == MSG_TYPE_USERLIST) {
             update_user_list_locked(packet.content);
         } else {
-            char own_join[MAX_MSG_LEN];
-            snprintf(own_join, sizeof(own_join), "%s 님이 입장하셨습니다.", nickname);
             if (packet.type == MSG_TYPE_NOTICE && strcmp(packet.sender, "시스템") == 0 &&
-                strcmp(packet.content, own_join) == 0)
+                strcmp(packet.content, own_join) == 0) {
+                /* 첫 입장 공지는 유지하고 이후 같은 닉네임의 입장 공지는 숨긴다. */
+                if (join_notice_seen) {
+                    pthread_mutex_unlock(&ui_lock);
+                    continue;
+                }
                 join_notice_seen = 1;
+            }
             add_message_locked(&packet);
         }
         int conflict = nickname_conflict;
