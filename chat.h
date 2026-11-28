@@ -25,6 +25,7 @@
 #define MAX_MSG_LEN     512                             /* 한 번에 보낼 수 있는 메시지 최대 길이 */
 #define RECENT_HISTORY  20                              /* 261122 JM 추가, 신규 입장 시 불러올 최근 대화 개수 */
 
+
 /* =========================================================================
  * 2. 메시지 종류 
  * ========================================================================= */
@@ -34,7 +35,8 @@ typedef enum {
     MSG_TYPE_WHISPER,          /* 특정 사람에게만 보내는 귓속말 */
     MSG_TYPE_LEAVE,            /* 정상적으로 방을 나감 (퇴장) */
     MSG_TYPE_NOTICE,            /* 서버가 전체에게 띄우는 시스템 공지 */
-    MSG_TYPE_USERLIST          /* 261122 JM추가. 접속자 리스트 동기화를 위한 패킷 */
+    MSG_TYPE_USERLIST,          /* 261122 JM추가. 접속자 리스트 동기화를 위한 패킷 */
+    MSG_TYPE_SUMMARY           /* AI 대화 요약 요청 */
 } MessageType;
 
 /* =========================================================================
@@ -111,5 +113,10 @@ static inline ssize_t recv_all(int sock_fd, void *buf, size_t len) {
 /* 파일 기록 모듈 (old_chat.c) 연동 함수 */
 int log_message(const Packet *pkt);
 int load_recent_history(Packet *out_packets, int max_count);
+
+/* AI 요약 모듈 (ai_summary.c) 연동 함수  */
+void ai_summary_init(void);
+void ai_summary_cleanup(void);
+int request_ai_summary_async(const Packet *history, int count, int write_fd);
 
 #endif /* CHAT_H */

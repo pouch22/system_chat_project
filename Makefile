@@ -5,8 +5,8 @@ CFLAGS = -Wall -Wextra -O2 -D_GNU_SOURCE
 
 all: server client
 
-server: server.c old_chat.c chat.h
-	$(CC) $(CFLAGS) -o $@ server.c old_chat.c
+server: server.c old_chat.c ai_summary.c chat.h
+	$(CC) $(CFLAGS) -pthread -o $@ server.c old_chat.c ai_summary.c -lcurl -lcjson
 
 client: client.c chat.h
 	$(CC) $(CFLAGS) -pthread -o $@ $< -lncursesw -ltinfo

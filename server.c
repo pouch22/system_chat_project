@@ -15,6 +15,11 @@ static int server_fd = -1;
 static int epoll_fd = -1;
 static volatile sig_atomic_t stop_requested = 0;
 
+static int summary_pipe_fd = -1;
+static int summary_requester_fd = -1;
+static char summary_buf[4096];
+static size_t summary_buf_len = 0;
+
 /* Ctrl+C/SIGTERM 종료 시 플래그만 설정하는 시그널 핸들러 (Async-Signal-Safe) */
 static void handle_sigint(int sig) {
     (void)sig;
@@ -29,6 +34,8 @@ static void cleanup_server(void) {
     }
     if (server_fd != -1) close(server_fd);
     if (epoll_fd != -1) close(epoll_fd);
+    if (summary_pipe_fd != -1) close(summary_pipe_fd);
+    ai_summary_cleanup();
     unlink(SOCKET_PATH);
 }
 
@@ -90,7 +97,9 @@ static void remove_client(int fd) {
             break;
         }
     }
-
+    if (fd == summary_requester_fd) {
+            summary_requester_fd = -1;
+        }
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
 
@@ -118,6 +127,7 @@ int main(void) {
     sigaction(SIGTERM, &sa, NULL);
 
     memset(clients, 0, sizeof(clients));
+    ai_summary_init();
 
     /* 1. 유닉스 도메인 소켓 생성 */
     server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -208,6 +218,45 @@ int main(void) {
                 ev.data.fd = client_fd;
                 epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
             }
+            /* A-2. AI 요약 파이프 결과 수신 */
+            else if (summary_pipe_fd != -1 && curr_fd == summary_pipe_fd) {
+                ssize_t n = read(summary_pipe_fd,
+                                 summary_buf + summary_buf_len,
+                                 sizeof(summary_buf) - 1 - summary_buf_len);
+                if (n > 0) {
+                    summary_buf_len += (size_t)n;
+                } else {
+                    summary_buf[summary_buf_len] = '\0';
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, summary_pipe_fd, NULL);
+                    close(summary_pipe_fd);
+                    summary_pipe_fd = -1;
+
+                    if (summary_requester_fd != -1) {
+                        Packet hdr = {0};
+                        hdr.type = MSG_TYPE_NOTICE;
+                        snprintf(hdr.sender, MAX_NAME_LEN, "시스템");
+                        snprintf(hdr.content, MAX_MSG_LEN, "[AI 최근 대화 요약 (나에게만 표시)]");
+                        hdr.timestamp = time(NULL);
+                        send_all(summary_requester_fd, &hdr, PACKET_SIZE);
+
+                        char *saveptr = NULL;
+                        char *line = strtok_r(summary_buf, "\n", &saveptr);
+                        while (line) {
+                            if (line[0] != '\0') {
+                                Packet lp = {0};
+                                lp.type = MSG_TYPE_NOTICE;
+                                snprintf(lp.sender, MAX_NAME_LEN, "시스템");
+                                snprintf(lp.content, MAX_MSG_LEN, "%s", line);
+                                lp.timestamp = time(NULL);
+                                send_all(summary_requester_fd, &lp, PACKET_SIZE);
+                            }
+                            line = strtok_r(NULL, "\n", &saveptr);
+                        }
+                        summary_requester_fd = -1;
+                    }
+                    summary_buf_len = 0;
+                }
+            }
             /* B. 기존 클라이언트의 메시지 수신 */
             else {
                 Packet pkt;
@@ -276,6 +325,65 @@ int main(void) {
 
                 } else if (pkt.type == MSG_TYPE_LEAVE) {
                     remove_client(curr_fd);
+                } else if (pkt.type == MSG_TYPE_SUMMARY) {
+                    const char *ollama_url = getenv("OLLAMA_URL");
+                    if (!ollama_url || !ollama_url[0]) {
+                        Packet no_ai = {0};
+                        no_ai.type = MSG_TYPE_NOTICE;
+                        snprintf(no_ai.sender, MAX_NAME_LEN, "시스템");
+                        snprintf(no_ai.content, MAX_MSG_LEN,
+                                 "AI 서버가 연결되어 있지 않습니다. (OLLAMA_URL 미설정)");
+                        no_ai.timestamp = time(NULL);
+                        send_all(curr_fd, &no_ai, PACKET_SIZE);
+                        continue;
+                    }
+                    if (summary_pipe_fd != -1) {
+                        Packet busy = {0};
+                        busy.type = MSG_TYPE_NOTICE;
+                        snprintf(busy.sender, MAX_NAME_LEN, "시스템");
+                        snprintf(busy.content, MAX_MSG_LEN, "이미 AI 요약이 진행 중입니다. 잠시 후 다시 시도하세요.");
+                        busy.timestamp = time(NULL);
+                        send_all(curr_fd, &busy, PACKET_SIZE);
+                        continue;
+                    }
+
+                    Packet history_pkts[RECENT_HISTORY];
+                    int hist_cnt = load_recent_history(history_pkts, RECENT_HISTORY);
+                    if (hist_cnt <= 0) {
+                        Packet empty = {0};
+                        empty.type = MSG_TYPE_NOTICE;
+                        snprintf(empty.sender, MAX_NAME_LEN, "시스템");
+                        snprintf(empty.content, MAX_MSG_LEN, "요약할 대화 기록이 없습니다.");
+                        empty.timestamp = time(NULL);
+                        send_all(curr_fd, &empty, PACKET_SIZE);
+                        continue;
+                    }
+
+                    int pfd[2];
+                    if (pipe(pfd) < 0) continue;
+
+                    if (request_ai_summary_async(history_pkts, hist_cnt, pfd[1]) < 0) {
+                        close(pfd[0]);
+                        close(pfd[1]);
+                        continue;
+                    }
+
+                    summary_pipe_fd = pfd[0];
+                    summary_requester_fd = curr_fd;
+                    summary_buf_len = 0;
+                    ev.events = EPOLLIN;
+                    ev.data.fd = summary_pipe_fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, summary_pipe_fd, &ev);
+
+                    printf("[서버] AI 요약 요청 (fd: %d, 최근 %d건)\n", curr_fd, hist_cnt);
+
+                    Packet wait_notice = {0};
+                    wait_notice.type = MSG_TYPE_NOTICE;
+                    snprintf(wait_notice.sender, MAX_NAME_LEN, "시스템");
+                    snprintf(wait_notice.content, MAX_MSG_LEN,
+                             "AI 대화 요약을 생성 중입니다. 잠시만 기다려주세요... (나에게만 표시)");
+                    wait_notice.timestamp = time(NULL);
+                    send_all(curr_fd, &wait_notice, PACKET_SIZE);
                 }
             }
         }

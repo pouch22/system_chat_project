@@ -359,7 +359,7 @@ static void render_locked(void) {
 
     werase(input_win);
     box(input_win, 0, 0);
-    mvwaddnstr(input_win, 0, 2, " Input | /users | /w name text | /quit ", width - 2);
+    mvwaddnstr(input_win, 0, 2, " Input | /users | /summary | /w name text | /quit ", width - 2);
     mvwaddstr(input_win, 1, 1, "> ");
     /* 편집 커서가 보이도록 가로 스크롤하고 선택 영역은 반전 표시한다. */
     int available = width - 3;
@@ -575,6 +575,16 @@ static int prepare_message_locked(Packet *packet) {
         snprintf(status_text, sizeof(status_text), "사용법: /users (추가 인수 없이 입력)");
         return 0;
     }
+
+    if (strcmp(text, "/summary") == 0) {
+        packet->type = MSG_TYPE_SUMMARY;
+        return 1;
+    }
+    if (strncmp(text, "/summary ", 9) == 0) {
+        snprintf(status_text, sizeof(status_text), "사용법: /summary (추가 인수 없이 입력)");
+        return 0;
+    }
+
     if (strcmp(text, "/w") == 0 || strncmp(text, "/w ", 3) == 0) {
         char *target = text + 2;
         while (*target == ' ') ++target;
@@ -795,6 +805,8 @@ int main(int argc, char **argv) {
                 snprintf(status_text, sizeof(status_text), "메시지 전송 실패. 아무 키나 누르면 종료합니다.");
                 running = 0;
                 exit_status = EXIT_FAILURE;
+            } else if (outgoing.type == MSG_TYPE_SUMMARY) {
+                clear_input_locked();
             } else if (outgoing.type != MSG_TYPE_LEAVE) {
                 add_message_locked(&outgoing);
                 /* 이미 전송한 메시지는 실행 취소로 복원하지 않는다. */
