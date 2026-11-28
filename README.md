@@ -1,6 +1,6 @@
 # 리눅스 기반 다중 터미널 채팅 시스템 (System Programming Team 5)
 
-리눅스 서버 내에서 다수의 사용자가 터미널을 통해 실시간으로 메시지를 주고받을 수 있는 **Unix Domain Socket(`AF_UNIX`) + `epoll` + `ncursesw` 멀티스레드 TUI 채팅 프로그램**입니다.
+리눅스 서버 내에서 다수의 사용자가 터미널을 통해 실시간으로 메시지를 주고받고, 최근 대화를 로컬 AI로 비동기 요약할 수 있는 **Unix Domain Socket(`AF_UNIX`) + `epoll` + `ncursesw` 멀티스레드 TUI 채팅 프로그램**입니다.
 
 ---
 
@@ -16,33 +16,42 @@
   * 한글 텍스트 깨짐과 표시 폭(2칸) 문제를 해결하기 위해 와이드 문자 라이브러리(`ncursesw`)를 채택했습니다.
 * **저수준 파일 I/O 기반 대화 기록 복원 (`open`, `read`, `write`, `lseek`)**
   * 모든 일반 채팅 패킷을 바이너리 로그 파일(`chat_history.log`)에 `O_APPEND | O_SYNC` 옵션으로 기록하고, 신규 입장 시 최근 20개의 대화를 자동 복원합니다.
+* **순수 C 비동기 로컬 AI 대화 요약 (`pthread` + `pipe` + `epoll` + `libcurl` + `cJSON`)**
+  * 스크립트 언어 없이 100% C 언어로 로컬 LLM(Ollama)과 연동하여 최근 20개 대화를 3줄 이내로 요약합니다.
+  * **논블로킹 Self-Pipe 패턴:** AI 응답을 기다리는 동안 전체 채팅 서버가 멈추지 않도록, 백그라운드 워커 스레드가 HTTP 요청을 처리해 익명 파이프(`pipe`)에 결과를 쓰고, 메인 서버의 `epoll`이 이를 비동기 수신합니다.
+  * **온프레미스 보안 및 폴백(Fallback):** 채팅 로그가 외부 클라우드로 유출되지 않도록 사설망(Tailscale VPN 등) 내 로컬 Ollama 서버와 통신하며, AI 서버가 미설정이거나 꺼져 있어도 기존 채팅 기능은 정상 동작합니다.
 
 ### 아키텍처 설계 배경
 
-초기에는 수업 범위 내의 파이프/FIFO(`mkfifo`)와 논블로킹(`O_NONBLOCK`) 구조를 검토했으나, 다음과 같은 시스템 한계를 발견하여 아키텍처를 고도화했습니다.
+초기에는 수업 범위 내의 파이프/FIFO(`mkfifo`)와 논블로킹(`O_NONBLOCK`) 구조를 검토했으나, 다음과 같은 시스템 한계를 발견하여 아키텍처를 고도화했습니다. 이후 익명 파이프(`pipe`)는 채팅 중계 대신 **비동기 AI 워커 스레드와 `epoll` 메인 루프 간 결과 전달용**으로 적재적소에 재활용했습니다.
 
-| 구분 | 초기 검토안 (FIFO + 논블로킹 폴링) | 최종 채택안 (`AF_UNIX` + `epoll`) |
+| 구분 | 초기 검토안 (FIFO + 논블로킹 폴링) | 최종 채택안 (`AF_UNIX` + `epoll` + 비동기 `pipe`) |
 | :--- | :--- | :--- |
 | **CPU 효율성** | 반복 폴링으로 유휴 상태에서도 CPU 점유율 급증(99~100%) | 이벤트 발생 시에만 커널이 깨워주는 `epoll_wait`로 부하 최소화 |
 | **자원 회수 안정성** | 클라이언트 비정상 종료(`SIGKILL`) 시 `/tmp`에 개인 FIFO 파일 누적 | 클라이언트당 별도 파일 미생성, 비정상 종료 시 커널이 FD 자동 회수 및 EOF 통지 |
 | **서버 안정성** | 단일 클라이언트 지연 시 파이프 I/O 정체 | `sigaction` 안전 종료(`unlink`), `SIGPIPE` 무시, 소켓 타임아웃(`SO_RCVTIMEO`/`SO_SNDTIMEO`) 적용 |
+| **외부 I/O 분리** | 메인 루프 내 동기 대기 시 전체 채팅 정지 | 워커 스레드 + 익명 `pipe`를 `epoll`에 통합 감시하여 AI 요약 중에도 채팅 무중단 유지 |
 
 ---
 
 ## 2. 작동 방식 및 구조 (Architecture)
 
-프로그램은 공통 프로토콜 헤더(`chat.h`)를 중심으로 3개의 모듈로 나뉘어 독립적으로 작동하며 최종 결합됩니다.
+프로그램은 공통 프로토콜 헤더(`chat.h`)를 중심으로 4개의 모듈로 나뉘어 독립적으로 작동하며 최종 결합됩니다.
 
 * **`chat.h` (공통 프로토콜)**
-  * 고정 크기 패킷 구조체(`Packet`), 메시지 타입(`JOIN`, `CHAT`, `WHISPER`, `LEAVE`, `NOTICE`, `USERLIST`), 부분 송수신 방지 인라인 함수(`send_all`, `recv_all`)를 정의합니다.
+  * 고정 크기 패킷 구조체(`Packet`), 메시지 타입(`JOIN`, `CHAT`, `WHISPER`, `LEAVE`, `NOTICE`, `USERLIST`, `SUMMARY`), 부분 송수신 방지 인라인 함수(`send_all`, `recv_all`)를 정의합니다.
 * **`server.c` (서버 코어)**
   * `AF_UNIX` 리스닝 소켓(`/tmp/sysprog_chat.sock`)과 `epoll` 이벤트 루프로 최대 16명의 동시 접속을 관리합니다.
   * 일반 채팅 브로드캐스트, 1:1 귓속말 라우팅, 입·퇴장 시 접속자 목록(`MSG_TYPE_USERLIST`) 동기화, 발신자 위조 방지 및 `SIGINT`/`SIGTERM` 안전 종료를 담당합니다.
+  * `/summary` 요청 시 파이프 읽기 FD를 `epoll`에 등록해 비동기로 결과를 수신하며, **요청자에게만 1:1로 요약 결과를 전송**합니다(대기 중 요청자 이탈 시 `fd` 무효화 방어 로직 포함).
 * **`client.c` (클라이언트 및 TUI)**
   * `ncursesw` 기반 상단 채팅창 / 하단 입력창 2분할 TUI와 `pthread` 수신 스레드로 구성됩니다.
-  * `pthread_mutex`(`ui_lock`)로 화면 갱신 충돌을 방지하며, 한글 입력 편집, 스크롤, 닉네임 중복 감지 공지창을 지원합니다.
+  * `pthread_mutex`(`ui_lock`)로 화면 갱신 충돌을 방지하며, 한글 입력 편집, 스크롤, 닉네임 중복 감지 공지창, `/users` 및 `/summary` 명령어 처리를 지원합니다.
 * **`old_chat.c` (파일 입출력 및 기록)**
-  * 저수준 시스템 콜(`open`, `write`, `read`, `lseek`)로 채팅 패킷을 `chat_history.log`에 저장하고, 신규 클라이언트 입장 시 서버가 최근 20개 대화를 자동으로 불러와 전송할 수 있도록 지원합니다.
+  * 저수준 시스템 콜(`open`, `write`, `read`, `lseek`)로 채팅 패킷을 `chat_history.log`에 저장하고, 신규 클라이언트 입장 및 AI 요약 요청 시 최근 20개 대화를 불러올 수 있도록 지원합니다.
+* **`ai_summary.c` (비동기 로컬 AI 요약 모듈)**
+  * `pthread` 분리 스레드(`pthread_detach`)에서 `cJSON`으로 Ollama `/api/chat` 요청 본문(`think: false`, `stream: false`)을 생성하고 `libcurl`로 HTTP POST 요청을 수행합니다.
+  * 응답 파싱 후 결과를 익명 파이프로 전달하며, 타임아웃·연결 실패 시 한글 안내 메시지를 반환합니다.
 
 ---
 
@@ -50,11 +59,13 @@
 
 ### 개발 및 테스트 환경
 * Ubuntu 22.04 LTS (x86_64), GCC, Make
-* 필수 라이브러리: `libncursesw5-dev` (한글 TUI 출력용)
+* 필수 라이브러리:
+  * `libncursesw5-dev` (한글 TUI 출력용)
+  * `libcurl4-openssl-dev`, `libcjson-dev` (순수 C HTTP 통신 및 JSON 파싱용)
 
 ```bash
-# ncursesw 개발 패키지가 없는 경우 설치
-sudo apt-get update && sudo apt-get install -y libncursesw5-dev
+# 필수 개발 패키지 설치
+sudo apt-get update && sudo apt-get install -y libncursesw5-dev libcurl4-openssl-dev libcjson-dev
 ```
 
 ### 빌드
@@ -65,10 +76,20 @@ make clean  # 빌드된 실행 파일 정리
 
 ### 실행
 1. **서버 실행** (터미널 1)
-   ```bash
-   ./server
-   ```
-   > 종료 시 `Ctrl+C`를 누르면 열려 있는 소켓과 `/tmp/sysprog_chat.sock` 파일을 안전하게 정리하고 종료합니다.
+
+   * **기본 실행 (AI 요약 미연결 모드):**
+     ```bash
+     ./server
+     ```
+     > AI 서버 설정 없이도 일반 채팅·귓속말·접속자 목록·로그 복원이 모두 정상 동작합니다. 이 상태에서 `/summary`를 입력하면 AI 미연결 안내 메시지가 표시됩니다.
+
+   * **로컬 AI 요약 활성화 실행 (Ollama 연동 모드):**
+     ```bash
+     export OLLAMA_URL="http://<Ollama_서버_IP>:11434/api/chat"
+     export OLLAMA_MODEL="qwen3:8b"
+     ./server
+     ```
+     > 사설 VPN(Tailscale 등)이나 로컬 네트워크로 연결된 Ollama 서버 주소를 환경변수로 주입합니다. 종료 시 `Ctrl+C`를 누르면 소켓과 `/tmp/sysprog_chat.sock` 파일을 안전하게 정리하고 종료합니다.
 
 2. **클라이언트 실행** (터미널 2, 3, ...)
    ```bash
@@ -88,6 +109,7 @@ make clean  # 빌드된 실행 파일 정리
 | `<일반 텍스트>` | 현재 접속 중인 모든 사용자에게 브로드캐스트 전송 및 로그 저장 |
 | `/w <상대닉네임> <내용>` | 특정 사용자에게만 1:1 귓속말 전송 |
 | `/users` | 현재 접속자 목록 조회 (서버 로그/타인 화면에 남지 않고 내 화면에만 표시) |
+| `/summary` | 최근 20개 대화 내용을 로컬 AI로 3줄 요약 (요청자 화면에만 비동기 표시) |
 | `/quit` | 채팅방 정상 퇴장 |
 
 ### TUI 조작 및 편집 단축키
@@ -101,9 +123,9 @@ make clean  # 빌드된 실행 파일 정리
 
 | 역할 | 담당자 | 핵심 사용 기술 (System Calls) | 주요 구현 내용 |
 | :---: | :---: | :--- | :--- |
-| **서버 코어** | **김●민** | `epoll`, `socket` (`AF_UNIX`), `sigaction`, `setsockopt` | - 다중 접속 세션 관리, 브로드캐스트/귓속말/접속자 목록 동기화<br>- 시그널 안전 종료(`unlink`), 소켓 타임아웃 및 패킷 무결성 검증 |
-| **TUI 화면** | **서●빈** | `ncursesw`, `pthread`, `mutex` | - 상/하단 터미널 창 분할, 방향키 스크롤 및 텍스트 편집기 구현<br>- UTF-8 한글 표시 폭 처리 및 `/users` 로컬 목록 조회<br>- **Mutex 락:** 타자 입력 중 메시지 수신 시 화면 깨짐 방지 |
-| **파일 기록** | **권●서** | `open`, `read`, `write`, `lseek` | - 저수준 파일 I/O(`O_APPEND \| O_SYNC`) 기반 바이너리 채팅 로그 저장<br>- 신규 입장 시 최근 20개 대화 기록 복원 |
+| **서버 코어 & AI 연동** | **김●민** | `epoll`, `socket` (`AF_UNIX`), `pipe`, `pthread`, `libcurl`, `cJSON`, `sigaction` | - 다중 접속 세션 관리, 브로드캐스트/귓속말/접속자 목록 동기화<br>- 시그널 안전 종료(`unlink`), 소켓 타임아웃 및 패킷 무결성 검증<br>- 비동기 파이프·`epoll` 통합 기반 로컬 AI(Ollama) 대화 요약 모듈 구현 |
+| **TUI 화면** | **서●빈** | `ncursesw`, `pthread`, `mutex` | - 상/하단 터미널 창 분할, 방향키 스크롤 및 텍스트 편집기 구현<br>- UTF-8 한글 표시 폭 처리 및 `/users`, `/summary` 명령어 인터페이스<br>- **Mutex 락:** 타자 입력 중 메시지 수신 시 화면 깨짐 방지 |
+| **파일 기록** | **권●서** | `open`, `read`, `write`, `lseek` | - 저수준 파일 I/O(`O_APPEND \| O_SYNC`) 기반 바이너리 채팅 로그 저장<br>- 신규 입장 및 AI 요약 시 최근 20개 대화 기록 복원 |
 | **빌드** | **김●빈** | `Makefile`, 아키텍처 설계 | - `Makefile` 빌드 자동화, 프로젝트 통합 테스트 및 시연 영상 녹화<br>- 프로그램 구조도(아키텍처) 및 발표 PPT 제작 |
 
 ---
@@ -125,8 +147,7 @@ make clean  # 빌드된 실행 파일 정리
 - [x] **11.11:** 패킷 구조 정의, 헤더 파일(`chat.h`) 확정 및 배포
 - [x] **11.14:** 팀원별 담당 모듈 뼈대(Skeleton) 코드 작성 완료
 - [x] **11.18:** TUI 화면 렌더링 및 클라이언트 간 메시지 송수신 1차 테스트
-- [x] **11.23:** 개별 모듈 통합(Merge) 연동 테스트 및 `Makefile` 제작, 개발 완료
-- [ ] **11.26:** 발표용 구조도 작성, 시연 대본 및 PPT 제작
+- [x] **11.23:** 개별 모듈 통합(Merge) 연동 테스트 및 `Makefile` 제작
+- [x] **11.28:** 순수 C 비동기 로컬 AI 대화 요약(`/summary`, Ollama 연동) 기능 추가 및 통합
 - [ ] **11.30:** 프로젝트 Deadline / PPT, 발표준비, 시연영상 준비 완료
 - [ ] **12.02:** **프로젝트 최종 발표**
-
